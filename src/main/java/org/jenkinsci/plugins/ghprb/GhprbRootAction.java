@@ -1,40 +1,54 @@
 package org.jenkinsci.plugins.ghprb;
 
 import hudson.Extension;
-import hudson.model.AbstractProject;
+import hudson.model.Job;
 import hudson.model.UnprotectedRootAction;
 import hudson.security.ACL;
 import hudson.security.csrf.CrumbExclusion;
-import jenkins.model.Jenkins;
-
 import org.acegisecurity.Authentication;
 import org.acegisecurity.context.SecurityContextHolder;
 import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang.StringUtils;
+import org.kohsuke.github.GHEventPayload.IssueComment;
+import org.kohsuke.github.GHEventPayload.PullRequest;
+import org.kohsuke.github.GHIssueState;
+import org.kohsuke.github.GitHub;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.StaplerResponse;
 
+import javax.servlet.FilterChain;
+import javax.servlet.ServletException;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.StringReader;
 import java.io.UnsupportedEncodingException;
 import java.net.URLDecoder;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.WeakHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-import javax.servlet.FilterChain;
-import javax.servlet.ServletException;
-import javax.servlet.http.HttpServletResponse;
-import javax.servlet.http.HttpServletRequest;
-
 /**
- * @author Honza Brázdil <jbrazdil@redhat.com>
+ * @author Honza Brázdil jbrazdil@redhat.com
  */
 @Extension
 public class GhprbRootAction implements UnprotectedRootAction {
+
     static final String URL = "ghprbhook";
-    private static final Logger logger = Logger.getLogger(GhprbRootAction.class.getName());
+
+    private static final Logger LOGGER = Logger.getLogger(GhprbRootAction.class.getName());
+
+    private static final int PAYLOAD_LENGTH = 8;
+
+    private Set<StartTrigger> triggerThreads;
+
+    private ExecutorService pool;
 
     public String getIconFileName() {
         return null;
@@ -48,51 +62,220 @@ public class GhprbRootAction implements UnprotectedRootAction {
         return URL;
     }
 
-    public void doIndex(StaplerRequest req, StaplerResponse resp) {
-        String event = req.getHeader("X-GitHub-Event");
-        String signature = req.getHeader("X-Hub-Signature");
-        String type = req.getContentType();
+    public int getThreadCount() {
+        return triggerThreads == null ? 0 : triggerThreads.size();
+    }
+
+    public GhprbRootAction() {
+        triggerThreads = Collections.newSetFromMap(new WeakHashMap<StartTrigger, Boolean>());
+        this.pool = Executors.newCachedThreadPool();
+    }
+
+    public void doIndex(StaplerRequest req,
+                        StaplerResponse resp) {
+        final String event = req.getHeader("X-GitHub-Event");
+        final String signature = req.getHeader("X-Hub-Signature");
+        final String type = req.getContentType();
         String payload = null;
         String body = null;
 
-        if ("application/json".equals(type)) {
+        if (type != null && type.toLowerCase().startsWith("application/json")) {
             body = extractRequestBody(req);
             if (body == null) {
-                logger.log(Level.SEVERE, "Can't get request body for application/json.");
+                LOGGER.log(Level.SEVERE, "Can't get request body for application/json.");
+                resp.setStatus(StaplerResponse.SC_BAD_REQUEST);
                 return;
             }
             payload = body;
-        } else if ("application/x-www-form-urlencoded".equals(type)) {
+        } else if (type != null && type.toLowerCase().startsWith("application/x-www-form-urlencoded")) {
             body = extractRequestBody(req);
-            if (body == null || body.length() <= 8) {
-                logger.log(Level.SEVERE, "Request doesn't contain payload. "
-                        + "You're sending url encoded request, so you should pass github payload through 'payload' request parameter");
+            if (body == null || body.length() <= PAYLOAD_LENGTH) {
+                LOGGER.log(Level.SEVERE,
+                        "Request doesn't contain payload. You are sending url encoded request, "
+                        + "so you should pass github payload through 'payload' request parameter");
+                resp.setStatus(StaplerResponse.SC_BAD_REQUEST);
                 return;
             }
             try {
                 String encoding = req.getCharacterEncoding();
-                payload = URLDecoder.decode(body.substring(8), encoding != null ? encoding : "UTF-8");
+                payload = URLDecoder.decode(body.substring(PAYLOAD_LENGTH), encoding != null ? encoding : "UTF-8");
             } catch (UnsupportedEncodingException e) {
-                logger.log(Level.SEVERE, "Error while trying to decode the payload");
+                LOGGER.log(Level.SEVERE, "Error while trying to decode the payload");
+                resp.setStatus(StaplerResponse.SC_BAD_REQUEST);
                 return;
             }
         }
 
         if (payload == null) {
-            logger.log(Level.SEVERE, "Payload is null, maybe content type '{0}' is not supported by this plugin. "
-                    + "Please use 'application/json' or 'application/x-www-form-urlencoded'",
-                    new Object[] { type });
+            LOGGER.log(Level.SEVERE,
+                    "Payload is null, maybe content type ''{0}'' is not supported by this plugin. "
+                            + "Please use 'application/json' or 'application/x-www-form-urlencoded'",
+                    new Object[] {type});
+            resp.setStatus(StaplerResponse.SC_UNSUPPORTED_MEDIA_TYPE);
             return;
         }
 
-        for (GhprbWebHook webHook : getWebHooks()) {
+        LOGGER.log(Level.FINE, "Got payload event: {0}", event);
+        final String threadBody = body;
+        final String threadPayload = payload;
+        handleAction(event, signature, threadPayload, threadBody);
+    }
+
+    private void handleAction(String event,
+                              String signature,
+                              String payload,
+                              String body) {
+
+        // Not sure if this is needed, but it may be to get info about old builds.
+        Authentication old = SecurityContextHolder.getContext().getAuthentication();
+        SecurityContextHolder.getContext().setAuthentication(ACL.SYSTEM);
+
+        IssueComment comment = null;
+        PullRequest pr = null;
+        String repoName = null;
+
+        try {
+            GitHub gh = GitHub.connectAnonymously();
+
+            if (StringUtils.equalsIgnoreCase("issue_comment", event)) {
+
+                comment = getIssueComment(payload, gh);
+                GHIssueState state = comment.getIssue().getState();
+
+                if (state == GHIssueState.CLOSED) {
+                    LOGGER.log(Level.INFO, "Skip comment on closed PR");
+                    return;
+                }
+
+                if (!comment.getIssue().isPullRequest()) {
+                    LOGGER.log(Level.INFO, "Skip comment on Issue");
+                    return;
+                }
+
+                repoName = comment.getRepository().getFullName();
+
+                LOGGER.log(Level.INFO,
+                        "Checking issue comment ''{0}'' for repo {1}",
+                        new Object[] {comment.getComment().getBody(), repoName});
+
+            } else if (StringUtils.equalsIgnoreCase("pull_request", event)) {
+
+                pr = getPullRequest(payload, gh);
+                repoName = pr.getRepository().getFullName();
+
+                LOGGER.log(Level.INFO, "Checking PR #{1} for {0}", new Object[] {repoName, pr.getNumber()});
+
+            } else {
+                LOGGER.log(Level.WARNING, "Request not known for event: {0}", new Object[] {event});
+                return;
+            }
+
+            Set<GhprbTrigger> triggers = getTriggers(repoName, body, signature);
+
+            handleEvent(triggers, payload, pr, comment);
+
+        } catch (IOException e) {
+            LOGGER.log(Level.SEVERE, "Unable to connect to GitHub anonymously", e);
+        } finally {
+            SecurityContextHolder.getContext().setAuthentication(old);
+        }
+    }
+
+    private class StartTrigger implements Runnable {
+        private GhprbTrigger trigger;
+
+        private PullRequest pr;
+
+        private IssueComment comment;
+
+        @Override
+        public void run() {
             try {
-                webHook.handleWebHook(event, payload, body, signature);
+                if (pr != null) {
+                    triggerPr(trigger, pr);
+                }
+
+                if (comment != null) {
+                    triggerComment(trigger, comment);
+                }
             } catch (Exception e) {
-                logger.log(Level.SEVERE, "Unable to process web hook for: " + webHook.getProjectName(), e);
+                LOGGER.log(Level.SEVERE, "Failed to run thread", e);
+            } finally {
+                triggerThreads.remove(this);
             }
         }
-        
+    }
+
+    private void handleEvent(Set<GhprbTrigger> triggers,
+                             String payload,
+                             PullRequest anonPr,
+                             IssueComment anonComment) {
+
+        for (final GhprbTrigger trigger : triggers) {
+            try {
+                final StartTrigger runner = new StartTrigger();
+                runner.trigger = trigger;
+                if (anonPr != null) {
+                    runner.pr = getPullRequest(payload, trigger.getGitHub());
+                }
+                if (anonComment != null) {
+                    runner.comment = getIssueComment(payload, trigger.getGitHub());
+                }
+
+                triggerThreads.add(runner);
+                pool.submit(runner);
+            } catch (IOException e) {
+                LOGGER.log(Level.SEVERE, "Unable to get authorized version of event", e);
+            }
+        }
+    }
+
+    private void triggerComment(final GhprbTrigger trigger,
+                                final IssueComment comment) {
+        new Thread() {
+            public void run() {
+                try {
+                    trigger.handleComment(comment);
+                } catch (Exception e) {
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("Unable to handle comment for PR# ");
+                    sb.append(comment.getIssue().getId());
+                    sb.append(", repo: ");
+                    sb.append(comment.getRepository().getFullName());
+
+                    LOGGER.log(Level.SEVERE, sb.toString(), e);
+                }
+            }
+        }.start();
+    }
+
+    private void triggerPr(final GhprbTrigger trigger,
+                           final PullRequest pr) {
+        new Thread() {
+            public void run() {
+                try {
+                    trigger.handlePR(pr);
+                } catch (Throwable th) {
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("Unable to handle PR# ");
+                    sb.append(pr.getNumber());
+                    sb.append(" for repo: ");
+                    sb.append(pr.getRepository().getFullName());
+                    LOGGER.log(Level.SEVERE, sb.toString(), th);
+                }
+            }
+        }.start();
+    }
+
+    private PullRequest getPullRequest(String payload,
+                                       GitHub gh) throws IOException {
+        PullRequest pr = gh.parseEventPayload(new StringReader(payload), PullRequest.class);
+        return pr;
+    }
+
+    private IssueComment getIssueComment(String payload,
+                                         GitHub gh) throws IOException {
+        return gh.parseEventPayload(new StringReader(payload), IssueComment.class);
     }
 
     private String extractRequestBody(StaplerRequest req) {
@@ -109,38 +292,42 @@ public class GhprbRootAction implements UnprotectedRootAction {
         return body;
     }
 
-    
-    private Set<GhprbWebHook> getWebHooks() {
-        final Set<GhprbWebHook> webHooks = new HashSet<GhprbWebHook>();
+    private Set<GhprbTrigger> getTriggers(String repoName,
+                                          String body,
+                                          String signature) {
+        Set<GhprbTrigger> triggers = new HashSet<GhprbTrigger>();
 
-        // We need this to get access to list of repositories
-        Authentication old = SecurityContextHolder.getContext().getAuthentication();
-        SecurityContextHolder.getContext().setAuthentication(ACL.SYSTEM);
-
-        try {
-            for (AbstractProject<?, ?> job : Jenkins.getInstance().getAllItems(AbstractProject.class)) {
-                GhprbTrigger trigger = job.getTrigger(GhprbTrigger.class);
-                if (trigger == null || trigger.getWebHook() == null) {
+        Set<Job<?, ?>> projects = GhprbTrigger.getDscp().getRepoTriggers(repoName);
+        if (projects != null) {
+            for (Job<?, ?> project : projects) {
+                GhprbTrigger trigger = Ghprb.extractTrigger(project);
+                if (trigger == null) {
+                    LOGGER.log(Level.WARNING,
+                            "Warning, trigger unexpectedly null for project " + project.getFullName());
                     continue;
                 }
-                webHooks.add(trigger.getWebHook());
+                try {
+                    if (trigger.matchSignature(body, signature)) {
+                        triggers.add(trigger);
+                    }
+                } catch (Exception e) {
+                    LOGGER.log(Level.SEVERE,
+                            "Failed to match signature for trigger on project: " + trigger.getProjectName(),
+                            e);
+                }
             }
-        } finally {
-            SecurityContextHolder.getContext().setAuthentication(old);
         }
+        return triggers;
 
-        if (webHooks.size() == 0) {
-            logger.log(Level.WARNING, "No projects found using GitHub pull request trigger");
-        }
-
-        return webHooks;
     }
 
     @Extension
     public static class GhprbRootActionCrumbExclusion extends CrumbExclusion {
 
         @Override
-        public boolean process(HttpServletRequest req, HttpServletResponse resp, FilterChain chain) throws IOException, ServletException {
+        public boolean process(HttpServletRequest req,
+                               HttpServletResponse resp,
+                               FilterChain chain) throws IOException, ServletException {
             String pathInfo = req.getPathInfo();
             if (pathInfo != null && pathInfo.equals(getExclusionPath())) {
                 chain.doFilter(req, resp);

@@ -22,10 +22,10 @@ f.advanced() {
     f.checkbox(default: descriptor.autoCloseFailedPullRequests) 
   }
   f.entry(field: "skipBuildPhrase", title: _("Skip build phrase")) {
-    f.textarea(default: descriptor.skipBuildPhrase) 
+    f.textbox(default: descriptor.skipBuildPhrase)
   }
   f.entry(field: "displayBuildErrorsOnDownstreamBuilds", title: _("Display build errors on downstream builds?")) {
-    f.checkbox(default: descriptor.displayBuildErrorsOnDownstreamBuilds) 
+    f.checkbox(default: descriptor.displayBuildErrorsOnDownstreamBuilds)
   }
   f.entry(field: "cron", title: _("Crontab line"), help: "/descriptor/hudson.triggers.TimerTrigger/help/spec") {
     f.textbox(default: descriptor.cron, checkUrl: "'descriptorByName/hudson.triggers.TimerTrigger/checkSpec?value=' + encodeURIComponent(this.value)") 
@@ -36,11 +36,23 @@ f.advanced() {
   f.entry(field: "orgslist", title: _("List of organizations. Their members will be whitelisted.")) {
     f.textarea() 
   }
+  f.entry(field: "blackListLabels", title: _("List of GitHub labels for which the build should not be triggered.")) {
+    f.textarea()
+  }
+  f.entry(field: "whiteListLabels", title: _("List of GitHub labels for which the build should only be triggered. (Leave blank for 'any')")) {
+    f.textarea()
+  }
   f.entry(field: "allowMembersOfWhitelistedOrgsAsAdmin", title: "Allow members of whitelisted organizations as admins") {
     f.checkbox() 
   }
   f.entry(field: "permitAll", title: "Build every pull request automatically without asking (Dangerous!).") {
     f.checkbox() 
+  }
+  f.entry(field: "buildDescTemplate", title: _("Build description template")) {
+      f.textarea()
+  }
+  f.entry(field: "blackListCommitAuthor", title: _("Blacklist commit authors")) {
+    f.textbox(default: descriptor.blackListCommitAuthor)
   }
   f.entry(field: "whiteListTargetBranches", title: _("Whitelist Target Branches:")) {
     f.repeatable(field: "whiteListTargetBranches", minimum: "1", add: "Add Branch") {
@@ -55,6 +67,26 @@ f.advanced() {
         }
       }
     }
+  }
+  f.entry(field: "blackListTargetBranches", title: _("Blacklist Target Branches:")) {
+    f.repeatable(field: "blackListTargetBranches", minimum: "1", add: "Add Branch") {
+      table(width: "100%") {
+        f.entry(field: "branch") {
+          f.textbox() 
+        }
+        f.entry(title: "") {
+          div(align: "right") {
+            f.repeatableDeleteButton(value: "Delete Branch") 
+          }
+        }
+      }
+    }
+  }
+  f.entry(field: "includedRegions", title: _("Included regions")) {
+    f.textarea()
+  }
+  f.entry(field: "excludedRegions", title: _("Excluded regions")) {
+    f.textarea()
   }
 }
 f.advanced(title: _("Trigger Setup")) {

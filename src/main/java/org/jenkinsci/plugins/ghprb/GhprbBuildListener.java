@@ -1,34 +1,31 @@
 package org.jenkinsci.plugins.ghprb;
 
-import com.google.common.base.Optional;
 import hudson.Extension;
-import hudson.model.AbstractBuild;
+import hudson.model.Run;
 import hudson.model.TaskListener;
 import hudson.model.listeners.RunListener;
+
+import javax.annotation.Nonnull;
 
 /**
  * @author janinko
  */
 @Extension
-public class GhprbBuildListener extends RunListener<AbstractBuild<?, ?>> {
+public class GhprbBuildListener extends RunListener<Run<?, ?>> {
 
     @Override
-    public void onStarted(AbstractBuild<?, ?> build, TaskListener listener) {
-        final Optional<GhprbTrigger> trigger = findTrigger(build);
-        if (trigger.isPresent()) {
-            trigger.get().getBuilds().onStarted(build, listener);
+    public void onStarted(Run<?, ?> build, TaskListener listener) {
+        GhprbTrigger trigger = Ghprb.extractTrigger(build);
+        if (trigger != null && trigger.getBuilds() != null) {
+            trigger.getBuilds().onStarted(build, listener);
         }
     }
 
     @Override
-    public void onCompleted(AbstractBuild<?, ?> build, TaskListener listener) {
-        final Optional<GhprbTrigger> trigger = findTrigger(build);
-        if (trigger.isPresent()) {
-            trigger.get().getBuilds().onCompleted(build, listener);
+    public void onCompleted(Run<?, ?> build, @Nonnull TaskListener listener) {
+        GhprbTrigger trigger = Ghprb.extractTrigger(build);
+        if (trigger != null && trigger.getBuilds() != null) {
+            trigger.getBuilds().onCompleted(build, listener);
         }
-    }
-
-    private static Optional<GhprbTrigger> findTrigger(AbstractBuild<?, ?> build) {
-        return Optional.fromNullable(Ghprb.extractTrigger(build));
     }
 }
